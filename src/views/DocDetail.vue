@@ -1,5 +1,5 @@
 <script setup>
-import { ref, computed, onMounted, watch } from 'vue'
+import { ref, computed, onMounted, onBeforeUnmount, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { useKbStore } from '@/stores/kb'
 import { useAuthStore } from '@/stores/auth'
@@ -9,6 +9,7 @@ import MemberSelect from '@/components/common/MemberSelect.vue'
 import ShareDialog from '@/components/doc/ShareDialog.vue'
 import { formatFull, formatDate, avatarColor } from '@/utils/format'
 import { canEditDoc, canViewDoc } from '@/utils/permission'
+import { onDocChanged } from '@/utils/sync'
 
 const route = useRoute()
 const router = useRouter()
@@ -23,6 +24,8 @@ const commentText = ref('')
 const commentMentions = ref([])
 const showVersions = ref(false)
 const shareOpen = ref(false)
+// 从编辑器带过来的提示：本次保存与其他窗口的修改已自动合并
+const mergedJustNow = ref(route.query.merged === '1')
 
 const docId = computed(() => route.params.id)
 
@@ -65,7 +68,18 @@ function renderMention(content) {
 }
 
 onMounted(refresh)
-watch(docId, () => { if (route.name === 'docDetail') { refresh(); showVersions.value = false } })
+watch(docId, () => { if (route.name === 'docDetail') { refresh(); showVersions.value = false; mergedJustNow.value = route.query.merged === '1' } })
+
+// 其他窗口保存或删除当前文档时实时刷新详情与版本记录
+let unsubDocChanged = null
+onMounted(() => {
+  unsubDocChanged = onDocChanged((msg) => {
+    if (!msg || msg.id !== docId.value) return
+    if (msg.type === 'saved') refresh()
+    else if (msg.type === 'deleted') { notFound.value = true; doc.value = null }
+  })
+})
+onBeforeUnmount(() => unsubDocChanged?.())
 </script>
 
 <template>
@@ -74,6 +88,7 @@ watch(docId, () => { if (route.name === 'docDetail') { refresh(); showVersions.v
     <div v-else-if="notAllowed" class="empty"><div class="ico">🔒</div>该文档为私有，你没有查看权限</div>
 
     <template v-else-if="doc">
+      <div v-if="mergedJustNow" class="merged-banner card">🔀 已自动合并其他窗口在此期间保存的修改，双方内容与版本记录均已保留。</div>
       <div class="page-head card">
         <div class="title-row">
           <h1 class="title">{{ doc.title }}</h1>
@@ -96,6 +111,7 @@ watch(docId, () => { if (route.name === 'docDetail') { refresh(); showVersions.v
         <div v-for="v in [...doc.versions].reverse()" :key="v.version" class="ver">
           <span class="vnum">v{{ v.version }}</span>
           <span class="vnote">{{ v.note || '编辑' }}</span>
+          <span v-if="v.merged" class="vmerge" :title="'基于 v' + (v.baseRev || 1) + ' 合并'">🔀 合并</span>
           <span class="vwho">{{ userById[v.savedBy]?.name || v.savedBy }}</span>
           <span class="vtime">{{ formatFull(v.savedAt) }}</span>
         </div>
@@ -145,10 +161,12 @@ watch(docId, () => { if (route.name === 'docDetail') { refresh(); showVersions.v
 .pills { margin-right: 8px; }
 .who { color: var(--text-3); }
 .versions { margin-top: 14px; padding: 12px 20px; }
+.merged-banner { margin-bottom: 14px; padding: 12px 16px; background: var(--primary-weak); border-color: var(--primary); color: var(--primary); font-size: 13px; font-weight: 500; }
 .ver { display: flex; gap: 14px; padding: 7px 0; border-bottom: 1px dashed var(--border); font-size: 13px; }
 .ver:last-child { border-bottom: none; }
 .vnum { font-weight: 700; color: var(--primary); min-width: 40px; }
 .vnote { flex: 1; }
+.vmerge { color: #c77a2b; font-size: 12px; }
 .vwho { color: var(--text-2); }
 .vtime { color: var(--text-3); }
 
