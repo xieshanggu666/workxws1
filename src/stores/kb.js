@@ -2,6 +2,7 @@ import { defineStore } from 'pinia'
 import { ref, computed } from 'vue'
 import { db } from '@/db'
 import { uid } from '@/utils/format'
+import { ensureVersions, mergeDocFields } from '@/utils/version'
 import { useAuthStore } from './auth'
 
 export const useKbStore = defineStore('kb', () => {
@@ -32,6 +33,14 @@ export const useKbStore = defineStore('kb', () => {
     return docs.value.find((d) => d.id === id) || null
   }
 
+  // 直接读库取最新文档，绕过内存缓存——编辑器打开文档、保存前校验时必须用最新数据，
+  // 否则多窗口场景会基于过期快照判断，造成覆盖与版本记录丢失
+  async function getDocFresh(id) {
+    await loadAll()
+    const fresh = await db.docs.get(id)
+    return fresh || null
+  }
+
   async function createDoc(payload, currentUser) {
     await loadAll()
     const now = new Date().toISOString()
@@ -53,24 +62,61 @@ export const useKbStore = defineStore('kb', () => {
     return doc
   }
 
-  async function updateDoc(id, patch, currentUser, note) {
+  // 保存文档（乐观锁 + 三方合并）。
+  // opts.baseVersion：编辑器打开文档时的版本号；保存时若库中版本更高，说明其他窗口已保存过
+  // opts.base：编辑器打开时的字段快照，用于三方合并（只自动合并未被对方改动的字段）
+  // opts.force：用户确认「以我的内容为准」时强制保存，冲突字段取本次提交值
+  // 返回 { status: 'saved', doc, autoMerged } | { status: 'conflict', conflictFields, autoMerged, latest } | { status: 'missing' }
+  async function updateDoc(id, patch, currentUser, note, opts = {}) {
     await loadAll()
-    const existing = docs.value.find((d) => d.id === id)
-    if (!existing) return null
     const now = new Date().toISOString()
-    const nextVersion = existing.versions.length + 1
-    const updated = {
-      ...existing,
-      ...patch,
-      updatedAt: now,
-      versions: [
-        ...existing.versions,
-        { version: nextVersion, savedAt: now, savedBy: currentUser?.id || 'u-guest', note: note || '编辑文档' }
-      ]
-    }
-    await db.docs.put(updated)
+    const savedBy = currentUser?.id || 'u-guest'
+    let result = null
+    // 读 + 写放在同一事务中，保证「检测版本 → 合并 → 追加版本记录」不被其他窗口的写入打断
+    await db.transaction('rw', db.docs, async () => {
+      const existing = await db.docs.get(id)
+      if (!existing) { result = { status: 'missing' }; return }
+      // 兼容已有文档：缺失的版本记录先补全，再在其后追加，历史版本永不丢弃
+      const versions = ensureVersions(existing, now)
+      const currentVersion = versions.length
+      const hasConflict = opts.baseVersion != null && currentVersion > opts.baseVersion
+
+      let fields = patch
+      let autoMerged = []
+      if (hasConflict) {
+        if (!opts.base) {
+          // 没有基线快照无法安全合并，除非强制保存，否则返回冲突由调用方决定
+          if (!opts.force) {
+            result = { status: 'conflict', conflictFields: Object.keys(patch), autoMerged, latest: existing }
+            return
+          }
+        } else {
+          const merge = mergeDocFields(existing, opts.base, patch)
+          autoMerged = merge.autoMerged
+          if (merge.conflicts.length && !opts.force) {
+            result = { status: 'conflict', conflictFields: merge.conflicts, autoMerged, latest: existing }
+            return
+          }
+          fields = merge.fields
+          // 用户选择以本次提交为准：冲突字段强制采用我方值，其余字段仍是合并结果
+          if (opts.force) for (const k of merge.conflicts) fields[k] = patch[k]
+        }
+      }
+
+      const versionNote = autoMerged.length
+        ? (note || '编辑文档') + '（自动合并：' + autoMerged.join('、') + '）'
+        : (note || '编辑文档')
+      const updated = {
+        ...existing,
+        ...fields,
+        updatedAt: now,
+        versions: [...versions, { version: currentVersion + 1, savedAt: now, savedBy, note: versionNote }]
+      }
+      await db.docs.put(updated)
+      result = { status: 'saved', doc: updated, autoMerged }
+    })
     await reloadDocs()
-    return updated
+    return result
   }
 
   async function deleteDoc(id) {
@@ -110,7 +156,7 @@ export const useKbStore = defineStore('kb', () => {
 
   return {
     docs, categories, tags, comments, loaded,
-    catMap, tagMap, loadAll, reloadDocs, getDoc, createDoc, updateDoc, deleteDoc,
+    catMap, tagMap, loadAll, reloadDocs, getDoc, getDocFresh, createDoc, updateDoc, deleteDoc,
     addCategory, addTag, addComment, commentsOf
   }
 })

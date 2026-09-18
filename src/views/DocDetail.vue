@@ -23,8 +23,12 @@ const commentText = ref('')
 const commentMentions = ref([])
 const showVersions = ref(false)
 const shareOpen = ref(false)
+// 保存时自动合并了其他窗口修改的提示（由编辑器跳转携带）
+const mergeNotice = ref('')
 
 const docId = computed(() => route.params.id)
+// 兼容旧数据：早期文档可能没有 versions 字段
+const versionList = computed(() => (doc.value?.versions?.length ? doc.value.versions : []))
 
 async function refresh() {
   if (!docId.value) return
@@ -64,7 +68,7 @@ function renderMention(content) {
   })
 }
 
-onMounted(refresh)
+onMounted(() => { mergeNotice.value = route.query.merged || ''; refresh() })
 watch(docId, () => { if (route.name === 'docDetail') { refresh(); showVersions.value = false } })
 </script>
 
@@ -74,6 +78,10 @@ watch(docId, () => { if (route.name === 'docDetail') { refresh(); showVersions.v
     <div v-else-if="notAllowed" class="empty"><div class="ico">🔒</div>该文档为私有，你没有查看权限</div>
 
     <template v-else-if="doc">
+      <div v-if="mergeNotice" class="card merge-note">
+        <span>ℹ️ 保存时已自动合并其他窗口对「{{ mergeNotice }}」的修改，双方内容均已保留</span>
+        <button class="btn sm ghost" @click="mergeNotice = ''">知道了</button>
+      </div>
       <div class="page-head card">
         <div class="title-row">
           <h1 class="title">{{ doc.title }}</h1>
@@ -88,12 +96,12 @@ watch(docId, () => { if (route.name === 'docDetail') { refresh(); showVersions.v
           <DocPill :doc="doc" class="pills" />
           <span class="who">作者：{{ userById[doc.ownerId]?.name || doc.ownerId }}</span>
           <span class="who">更新：{{ formatFull(doc.updatedAt) }}</span>
-          <button class="btn sm ghost" @click="showVersions = !showVersions">{{ showVersions ? '隐藏' : '查看' }}版本记录 ({{ doc.versions.length }})</button>
+          <button class="btn sm ghost" @click="showVersions = !showVersions">{{ showVersions ? '隐藏' : '查看' }}版本记录 ({{ versionList.length }})</button>
         </div>
       </div>
 
       <div v-if="showVersions" class="card versions">
-        <div v-for="v in [...doc.versions].reverse()" :key="v.version" class="ver">
+        <div v-for="v in [...versionList].reverse()" :key="v.version" class="ver">
           <span class="vnum">v{{ v.version }}</span>
           <span class="vnote">{{ v.note || '编辑' }}</span>
           <span class="vwho">{{ userById[v.savedBy]?.name || v.savedBy }}</span>
@@ -136,6 +144,7 @@ watch(docId, () => { if (route.name === 'docDetail') { refresh(); showVersions.v
 
 <style scoped>
 .detail { max-width: 860px; margin: 0 auto; }
+.merge-note { padding: 10px 20px; margin-bottom: 14px; display: flex; justify-content: space-between; align-items: center; gap: 12px; font-size: 13px; color: var(--primary); border-color: var(--primary); background: var(--primary-weak); }
 .page-head { padding: 20px 24px; }
 .title-row { display: flex; justify-content: space-between; align-items: center; gap: 16px; flex-wrap: wrap; }
 .title { margin: 0; font-size: 24px; }

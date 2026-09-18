@@ -8,6 +8,7 @@ import DocPill from '@/components/common/DocPill.vue'
 import RichEditor from '@/components/doc/RichEditor.vue'
 import { formatFull } from '@/utils/format'
 import { shareStatus, canShareEdit } from '@/utils/share'
+import { docVersion } from '@/utils/version'
 
 const route = useRoute()
 const kb = useKbStore()
@@ -20,8 +21,16 @@ const status = ref('loading')
 const editing = ref(false)
 const editBody = ref('')
 const saving = ref(false)
+// 乐观锁基线：开始编辑时的版本号与正文快照
+const baseVersion = ref(null)
+const baseDoc = ref(null)
+// 保存冲突信息；冲突时未提交内容保留在编辑器并写入本地备份
+const conflict = ref(null)
+const backup = ref(null)
+const savedToast = ref('')
 
 const token = computed(() => route.params.token)
+const backupKey = computed(() => 'kb:share-backup:' + (doc.value?.id || ''))
 const userById = computed(() => Object.fromEntries(auth.users.map((u) => [u.id, u])))
 // 编辑入口与链接状态绑定：撤销/过期后立即失去编辑权限
 const editable = computed(() => canShareEdit(share.value))
@@ -31,33 +40,83 @@ async function resolve(tokenVal) {
   share.value = null
   doc.value = null
   editing.value = false
+  conflict.value = null
   const s = await db.shares.where('token').equals(tokenVal).first()
   if (!s) { status.value = 'notfound'; return }
   const st = shareStatus(s)
   if (st === 'revoked') { status.value = 'revoked'; return }
   if (st === 'expired') { status.value = 'expired'; return }
-  const d = await kb.getDoc(s.docId)
+  // 直接读库，保证展示与编辑基线都是最新版本
+  const d = await kb.getDocFresh(s.docId)
   if (!d) { status.value = 'notfound'; return }
   share.value = s
   doc.value = d
   status.value = 'ok'
+  const b = localStorage.getItem(backupKey.value)
+  if (b) { try { backup.value = JSON.parse(b) } catch { localStorage.removeItem(backupKey.value) } }
 }
 
-function startEdit() {
+async function startEdit() {
+  // 开始编辑前取一次最新文档作为合并基线
+  const fresh = await kb.getDocFresh(doc.value.id)
+  if (fresh) doc.value = fresh
   editBody.value = doc.value.body
+  baseVersion.value = docVersion(doc.value)
+  baseDoc.value = { body: doc.value.body }
+  conflict.value = null
   editing.value = true
 }
 
-async function saveEdit() {
+function saveBackup() {
+  const b = { body: editBody.value, ts: Date.now() }
+  localStorage.setItem(backupKey.value, JSON.stringify(b))
+  backup.value = b
+}
+async function restoreBackup() {
+  if (!backup.value) return
+  if (!editing.value) await startEdit()
+  editBody.value = backup.value.body
+  dismissBackup()
+}
+function dismissBackup() {
+  backup.value = null
+  localStorage.removeItem(backupKey.value)
+}
+
+async function saveEdit(force = false) {
   if (saving.value) return
   saving.value = true
   try {
-    const updated = await kb.updateDoc(doc.value.id, { body: editBody.value }, auth.user, '通过共享链接编辑')
-    if (updated) doc.value = updated
+    const res = await kb.updateDoc(doc.value.id, { body: editBody.value }, auth.user, '通过共享链接编辑', { baseVersion: baseVersion.value, base: baseDoc.value, force })
+    if (!res || res.status === 'missing') { status.value = 'notfound'; return }
+    if (res.status === 'conflict') {
+      // 保留未提交内容：正文留在编辑器中，同时写入本地备份
+      conflict.value = res
+      saveBackup()
+      return
+    }
+    doc.value = res.doc
+    conflict.value = null
     editing.value = false
+    dismissBackup()
+    savedToast.value = res.autoMerged?.length ? '已保存，并自动合并了其他窗口的修改' : '已保存'
+    setTimeout(() => { savedToast.value = '' }, 3000)
   } finally {
     saving.value = false
   }
+}
+
+// 载入库中最新版本继续编辑；未提交内容已备份，可随时恢复
+async function loadLatest() {
+  const d = await kb.getDocFresh(doc.value.id)
+  if (!d) { status.value = 'notfound'; return }
+  doc.value = d
+  editBody.value = d.body
+  baseVersion.value = docVersion(d)
+  baseDoc.value = { body: d.body }
+  conflict.value = null
+  savedToast.value = '已载入最新版本，你未提交的内容已保留在备份中'
+  setTimeout(() => { savedToast.value = '' }, 3000)
 }
 
 onMounted(() => resolve(token.value))
@@ -85,18 +144,36 @@ watch(token, () => resolve(token.value))
         <div class="sub">
           <DocPill :doc="doc" />
           <span>更新于 {{ formatFull(doc.updatedAt) }}</span>
+          <span v-if="savedToast" class="ok-toast">{{ savedToast }}</span>
+        </div>
+      </div>
+
+      <div v-if="backup && !editing" class="card backup-bar">
+        <span>检测到你有一份未提交的修改（{{ new Date(backup.ts).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' }) }}）</span>
+        <div class="b-actions">
+          <button class="btn sm primary" @click="restoreBackup">恢复并继续编辑</button>
+          <button class="btn sm ghost" @click="dismissBackup">忽略</button>
         </div>
       </div>
 
       <template v-if="editing">
+        <div v-if="conflict" class="card conflict-bar">
+          <div class="c-head">⚠️ 保存冲突：这篇文档刚在其他窗口被修改并保存</div>
+          <div class="c-desc">你当前未提交的内容已自动备份，不会丢失。可选择覆盖保存，或载入最新版本后继续编辑。</div>
+          <div class="c-actions">
+            <button class="btn sm danger-solid" :disabled="saving" @click="saveEdit(true)">以我的内容覆盖保存</button>
+            <button class="btn sm" @click="loadLatest">载入最新版本</button>
+            <button class="btn sm ghost" @click="conflict = null">继续编辑</button>
+          </div>
+        </div>
         <div class="card editor-wrap">
           <RichEditor v-model="editBody" />
         </div>
         <div class="edit-bar card">
-          <span class="hint">修改将直接保存到原文档，并记录为新版本</span>
+          <span class="hint">修改将直接保存到原文档，并记录为新版本；若与他人同时保存会自动检测冲突</span>
           <div class="edit-actions">
             <button class="btn" :disabled="saving" @click="editing = false">取消</button>
-            <button class="btn primary" :disabled="saving" @click="saveEdit">{{ saving ? '保存中…' : '保存修改' }}</button>
+            <button class="btn primary" :disabled="saving" @click="saveEdit()">{{ saving ? '保存中…' : '保存修改' }}</button>
           </div>
         </div>
       </template>
@@ -130,4 +207,13 @@ watch(token, () => resolve(token.value))
 .edit-actions { display: flex; gap: 8px; }
 .foot { padding: 14px 20px; display: flex; justify-content: space-between; align-items: center; }
 .link-label { color: var(--text-3); font-size: 13px; }
+.ok-toast { color: var(--accent); font-size: 12px; }
+.conflict-bar { padding: 14px 20px; margin-bottom: 14px; border-color: var(--warn); background: #fff7ed; }
+.conflict-bar .c-head { font-weight: 600; color: #b45309; margin-bottom: 6px; }
+.conflict-bar .c-desc { font-size: 13px; color: var(--text-2); margin-bottom: 10px; }
+.conflict-bar .c-actions { display: flex; gap: 8px; }
+.btn.danger-solid { background: var(--danger); border-color: var(--danger); color: #fff; }
+.btn.danger-solid:hover { background: #d9444b; color: #fff; }
+.backup-bar { padding: 10px 20px; margin-bottom: 14px; display: flex; justify-content: space-between; align-items: center; gap: 12px; font-size: 13px; color: var(--text-2); border-color: var(--primary); background: var(--primary-weak); }
+.backup-bar .b-actions { display: flex; gap: 8px; }
 </style>
